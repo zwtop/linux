@@ -4778,6 +4778,62 @@ err_linearize:
 }
 EXPORT_SYMBOL_GPL(skb_segment_list);
 
+/*
+ * How many MSS segments may one output skb carry?  Zero when the skb fits
+ * the limits the egress device advertises, or when the device cannot
+ * offload its GSO type.
+ */
+static unsigned int skb_segment_max_segs(struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	netdev_features_t features;
+	unsigned int gso_max_size;
+	unsigned int hdr_len, max_segs;
+	unsigned int mss = skb_shinfo(skb)->gso_size;
+	struct tcphdr _tcph, *th;
+	__be16 protocol;
+
+	if (!dev || !skb_is_gso(skb) || !skb_is_gso_tcp(skb) ||
+	    skb->encapsulation || mss == GSO_BY_FRAGS ||
+	    !skb_mac_header_was_set(skb) ||
+	    !skb_transport_header_was_set(skb) ||
+	    skb_has_frag_list(skb))
+		return 0;
+
+	gso_max_size = netif_get_gso_max_size(dev, vlan_get_protocol(skb));
+	if (skb_shinfo(skb)->gso_segs <= READ_ONCE(dev->gso_max_segs) &&
+	    skb->len < gso_max_size)
+		return 0;
+
+	features = __netif_skb_features(skb, false);
+	if (!net_gso_ok(features | NETIF_F_GSO_ROBUST,
+			skb_shinfo(skb)->gso_type))
+		return 0;
+
+	if (!(features & NETIF_F_SG))
+		return 0;
+
+	protocol = skb_network_protocol(skb, NULL);
+	if (!protocol || !can_checksum_protocol(features, protocol))
+		return 0;
+
+	th = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcph),
+				&_tcph);
+	if (!th || th->doff < sizeof(*th) / 4)
+		return 0;
+
+	hdr_len = skb_transport_header(skb) - skb_mac_header(skb) +
+		  th->doff * 4;
+	if (gso_max_size <= hdr_len + mss)
+		return 0;
+
+	max_segs = (gso_max_size - hdr_len - 1) / mss;
+	max_segs = min_t(unsigned int, max_segs,
+			 READ_ONCE(dev->gso_max_segs));
+
+	return max_segs > 1 ? max_segs : 0;
+}
+
 /**
  *	skb_segment - Perform protocol segmentation on skb.
  *	@head_skb: buffer to segment
@@ -4799,6 +4855,7 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	unsigned int offset = doffset;
 	unsigned int tnl_hlen = skb_tnl_header_len(head_skb);
 	unsigned int partial_segs = 0;
+	unsigned int max_segs = skb_segment_max_segs(head_skb);
 	unsigned int headroom;
 	unsigned int len = head_skb->len;
 	struct sk_buff *frag_skb;
@@ -4839,7 +4896,7 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	csum = !!can_checksum_protocol(features, proto);
 
 	if (sg && csum && !gso_by_frags)  {
-		if (!(features & NETIF_F_GSO_PARTIAL)) {
+		if (!max_segs && !(features & NETIF_F_GSO_PARTIAL)) {
 			struct sk_buff *iter;
 			unsigned int frag_len;
 
@@ -4874,7 +4931,10 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 		 * now.
 		 */
 		DEBUG_NET_WARN_ON_ONCE(len / mss > GSO_MAX_SEGS);
-		partial_segs = min(len / mss, GSO_MAX_SEGS);
+		if (max_segs)
+			partial_segs = min(len / mss, max_segs);
+		else
+			partial_segs = min(len / mss, GSO_MAX_SEGS);
 		if (partial_segs > 1)
 			mss *= partial_segs;
 		else
