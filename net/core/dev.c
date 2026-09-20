@@ -3938,6 +3938,69 @@ netdev_features_t netif_skb_features(struct sk_buff *skb)
 }
 EXPORT_SYMBOL(netif_skb_features);
 
+static unsigned int
+skb_gso_resegment_max_segs(struct sk_buff *skb, struct net_device *dev,
+			   netdev_features_t features)
+{
+	unsigned int mss = skb_shinfo(skb)->gso_size;
+	unsigned int hdr_len, max_segs;
+	unsigned int gso_max_size;
+	struct tcphdr _tcph, *th;
+	__be16 protocol;
+
+	if (!skb_is_gso(skb) || !skb_is_gso_tcp(skb) ||
+	    skb->encapsulation || mss == GSO_BY_FRAGS ||
+	    !skb_mac_header_was_set(skb) ||
+	    !skb_transport_header_was_set(skb))
+		return 0;
+
+	if (!net_gso_ok(features | NETIF_F_GSO_ROBUST,
+			skb_shinfo(skb)->gso_type))
+		return 0;
+
+	if (!(features & NETIF_F_SG))
+		return 0;
+
+	protocol = skb_network_protocol(skb, NULL);
+	if (!protocol || !can_checksum_protocol(features, protocol))
+		return 0;
+
+	/*
+	 * The TCP frag-list path does not carry the bounded segment limit
+	 * through skb_segment_list().  Keep bounded resegmentation on the
+	 * regular skb path until that support is added.
+	 */
+	if (skb_has_frag_list(skb))
+		return 0;
+
+	gso_max_size = netif_get_gso_max_size(dev, vlan_get_protocol(skb));
+
+	/* Only the device limits can be fixed by resegmenting. */
+	if (skb_shinfo(skb)->gso_segs <= READ_ONCE(dev->gso_max_segs) &&
+	    skb->len < gso_max_size)
+		return 0;
+
+	th = skb_header_pointer(skb, skb_transport_offset(skb), sizeof(_tcph),
+				&_tcph);
+	if (!th || th->doff < sizeof(*th) / 4)
+		return 0;
+
+	hdr_len = skb_transport_header(skb) - skb_mac_header(skb) +
+		  th->doff * 4;
+	if (gso_max_size <= hdr_len + mss)
+		return 0;
+
+	/*
+	 * gso_within_device_limits() accepts gso_segs == gso_max_segs but
+	 * rejects skb->len >= gso_max_size, so only the size bound needs - 1.
+	 */
+	max_segs = (gso_max_size - hdr_len - 1) / mss;
+	max_segs = min_t(unsigned int, max_segs,
+			 READ_ONCE(dev->gso_max_segs));
+
+	return max_segs > 1 ? max_segs : 0;
+}
+
 static int xmit_one(struct sk_buff *skb, struct net_device *dev,
 		    struct netdev_queue *txq, bool more)
 {
@@ -4086,6 +4149,7 @@ out_free:
  */
 static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
 {
+	unsigned int resegment_max_segs = 0;
 	netdev_features_t features;
 
 	skb = validate_xmit_unreadable_skb(skb, dev);
@@ -4101,10 +4165,28 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device 
 	if (unlikely(!skb))
 		goto out_null;
 
-	if (netif_needs_gso(skb, features)) {
+	/*
+	 * A GSO skb which the device rejects as it is has lost its GSO
+	 * feature bits and is segmented down to MSS sized skbs below.  A
+	 * plain TCP skb can instead be split into GSO skbs which do fit, so
+	 * keep the bits and bound the resegmentation; the features computed
+	 * without the limit checks say whether the device offloads the GSO
+	 * type at all.
+	 */
+	if (unlikely(skb_is_gso(skb) && !(features & NETIF_F_GSO_MASK))) {
+		netdev_features_t offload = __netif_skb_features(skb, false);
+
+		resegment_max_segs =
+			skb_gso_resegment_max_segs(skb, dev, offload);
+		if (resegment_max_segs)
+			features = offload;
+	}
+
+	if (resegment_max_segs || netif_needs_gso(skb, features)) {
 		struct sk_buff *segs;
 
-		segs = skb_gso_segment(skb, features);
+		segs = __skb_gso_segment(skb, features, true,
+					 resegment_max_segs);
 		if (IS_ERR(segs)) {
 			goto out_kfree_skb;
 		} else if (segs) {
