@@ -3900,8 +3900,8 @@ static netdev_features_t gso_features_check(const struct sk_buff *skb,
 	return features;
 }
 
-static netdev_features_t __netif_skb_features(struct sk_buff *skb,
-					      bool check_gso_limits)
+netdev_features_t __netif_skb_features(struct sk_buff *skb,
+				       bool check_gso_limits)
 {
 	struct net_device *dev = skb->dev;
 	netdev_features_t features = dev->features;
